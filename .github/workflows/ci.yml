@@ -1,0 +1,192 @@
+name: CI (reusable)
+
+# Shared CI pipeline for the bun repositories. Callers pass one shell command
+# per job; everything else (runtime setup, lockfile discipline, Playwright
+# cache, optional PostgreSQL service, report upload) lives here once.
+#
+# Minimal caller:
+#
+#   jobs:
+#     ci:
+#       uses: chri5bot/workflows/.github/workflows/ci.yml@main
+#       with:
+#         static: bun run lint && bun run typecheck && bun run build
+#
+# Concurrency and triggers stay in the caller, where the repository owns them.
+
+on:
+  workflow_call:
+    inputs:
+      static:
+        description: Shell command for the static job (lint, format, typecheck, build).
+        type: string
+        default: bun run lint && bun run typecheck && bun run build
+      test:
+        description: Shell command for the unit-test job. An empty string skips the job.
+        type: string
+        default: bun run test
+      e2e:
+        description: Shell command for the end-to-end job. An empty string skips the job. The job never runs on draft pull requests.
+        type: string
+        default: ""
+      e2e-report:
+        description: Path uploaded as the playwright-report artifact after the e2e job.
+        type: string
+        default: playwright-report/
+      node-version:
+        description: Node.js version installed next to bun (scripts that run under node, tsx, typescript).
+        type: string
+        default: "24"
+      bun-version:
+        description: bun version. Leave empty to read the packageManager field of package.json.
+        type: string
+        default: ""
+      postgres:
+        description: Start a PostgreSQL service for the test and e2e jobs.
+        type: boolean
+        default: false
+      postgres-image:
+        type: string
+        default: postgres:17-alpine
+      postgres-user:
+        type: string
+        default: app
+      postgres-password:
+        type: string
+        default: app
+      postgres-db:
+        type: string
+        default: app_test
+      database-url-env:
+        description: Name of the environment variable that receives the PostgreSQL connection URL.
+        type: string
+        default: TEST_DATABASE_URL
+      static-timeout:
+        type: number
+        default: 10
+      test-timeout:
+        type: number
+        default: 10
+      e2e-timeout:
+        description: The Playwright browser install alone can take several minutes on a slow runner.
+        type: number
+        default: 25
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    name: Lint, typecheck and build
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.static-timeout }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.bun-version }}
+          bun-version-file: ${{ inputs.bun-version == '' && 'package.json' || '' }}
+      # --frozen-lockfile: a change to package.json without the matching
+      # bun.lock fails here instead of resolving to different versions.
+      - run: bun install --frozen-lockfile
+      - name: Static checks
+        run: ${{ inputs.static }}
+
+  test:
+    name: Unit tests
+    if: inputs.test != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.test-timeout }}
+    services:
+      postgres:
+        # An empty image skips the service, so PostgreSQL only starts on request.
+        image: ${{ inputs.postgres && inputs.postgres-image || '' }}
+        env:
+          POSTGRES_USER: ${{ inputs.postgres-user }}
+          POSTGRES_PASSWORD: ${{ inputs.postgres-password }}
+          POSTGRES_DB: ${{ inputs.postgres-db }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ${{ inputs.postgres-user }} -d ${{ inputs.postgres-db }}"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.bun-version }}
+          bun-version-file: ${{ inputs.bun-version == '' && 'package.json' || '' }}
+      - run: bun install --frozen-lockfile
+      - name: Expose the test database URL
+        if: inputs.postgres
+        run: echo "${{ inputs.database-url-env }}=postgresql://${{ inputs.postgres-user }}:${{ inputs.postgres-password }}@localhost:5432/${{ inputs.postgres-db }}" >> "$GITHUB_ENV"
+      - name: Unit tests
+        run: ${{ inputs.test }}
+
+  e2e:
+    name: End-to-end tests
+    # Actions minutes are a fixed monthly budget and e2e is the most expensive
+    # job: it runs on pushes to main and on pull requests that are ready for
+    # review, never on draft pushes (run it locally with `ci-run` while iterating).
+    if: inputs.e2e != '' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.e2e-timeout }}
+    services:
+      postgres:
+        image: ${{ inputs.postgres && inputs.postgres-image || '' }}
+        env:
+          POSTGRES_USER: ${{ inputs.postgres-user }}
+          POSTGRES_PASSWORD: ${{ inputs.postgres-password }}
+          POSTGRES_DB: ${{ inputs.postgres-db }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ${{ inputs.postgres-user }} -d ${{ inputs.postgres-db }}"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.bun-version }}
+          bun-version-file: ${{ inputs.bun-version == '' && 'package.json' || '' }}
+      - run: bun install --frozen-lockfile
+      - name: Expose the test database URL
+        if: inputs.postgres
+        run: echo "${{ inputs.database-url-env }}=postgresql://${{ inputs.postgres-user }}:${{ inputs.postgres-password }}@localhost:5432/${{ inputs.postgres-db }}" >> "$GITHUB_ENV"
+      # Cache the browser per Playwright version; system deps are not cached,
+      # so a hit still installs them (fast), a miss installs both.
+      - id: playwright-version
+        run: |
+          version=$(node -p "require('@playwright/test/package.json').version")
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}
+      - if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: bunx playwright install --with-deps chromium
+      - if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: bunx playwright install-deps chromium
+      - name: End-to-end tests
+        run: ${{ inputs.e2e }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report
+          path: ${{ inputs.e2e-report }}
+          retention-days: 14
